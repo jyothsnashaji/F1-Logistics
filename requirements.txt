@@ -1,0 +1,4 @@
+# Python dependencies for F1-Logistics project
+pandas
+numpy
+gurobipy
