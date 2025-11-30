@@ -1,6 +1,7 @@
 # constants.py
 
 import pandas as pd
+import random
 
 # Load unique circuits from circuits_mini.csv
 CIRCUITS_CSV_PATH = "data/circuits.csv"
@@ -18,11 +19,14 @@ TRANSPORT_LINKS = transport_links_df.to_dict(orient="records")
 SEASON_START = AVAILABLE_CIRCUITS[0] if AVAILABLE_CIRCUITS else None
 SEASON_END = AVAILABLE_CIRCUITS[-1] if AVAILABLE_CIRCUITS else None
 
-MINIMUM_REST_DAYS = 2
-TIME_TAKEN_PER_LINK = 1  # days
+# SEASON_START = random.choice(AVAILABLE_CIRCUITS) # [0] if AVAILABLE_CIRCUITS else None
+# SEASON_END = random.choice([c for c in AVAILABLE_CIRCUITS if c != SEASON_START]) # [-1] if AVAILABLE_CIRCUITS else None
+
+MINIMUM_REST_DAYS = 4
+TIME_TAKEN_PER_LINK = 3  # days
 LEAD_TIME_MIN = 5  # days
 
-TOTAL_NUM_REQUIRED_RACES = 12
-MAX_DAYS_IN_SEASON = 300
-NUM_DAYS_PER_RACE = 2
+TOTAL_NUM_REQUIRED_RACES = 10
+MAX_DAYS_IN_SEASON = 200
+NUM_DAYS_PER_RACE = 3
 CRAZY_BUG_NUMBER = 100000000000
