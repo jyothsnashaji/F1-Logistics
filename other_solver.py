@@ -61,26 +61,40 @@ def create_and_solve_gurobi_milp(data_loader, objective_index, number_of_solutio
         Z3_expr = Y.prod(R_i)         
 
         # Constraints
+        # C1: Race Count: Sum(y_i) = K
         m.addConstr(Y.sum('*') == K, "C1")
+
+        # C2: Fixed Start/End: y_S = 1, y_E = 1
         m.addConstr(Y[S] == 1, "C2_Start")
         m.addConstr(Y[E] == 1, "C2_End")
-        m.addConstrs((X.sum(i, '*', '*') == Y[i] for i in V if i != E), "C3_Out")
-        m.addConstrs((X.sum('*', j, '*') == Y[j] for j in V if j != S), "C4_In")
         
+        # C3: Single Link Out: Sum_j,m (x_ij^m) = y_i for all i
+        m.addConstrs((X.sum(i, '*', '*') == Y[i] for i in V if i != E), "C3_Out")
+        # C4: Single Link In: Sum_i,m (x_ij^m) = y_j for all j
+        m.addConstrs((X.sum('*', j, '*') == Y[j] for j in V if j != S), "C4_In")
+
+        # C5: Single Mode Per Link: Sum_m (x_ij^m) <= 1 for all (i,j) present in transport data
         link_pairs = list(set((k[0], k[1]) for k in links))
         m.addConstrs((X.sum(i, j, '*') <= 1 for i, j in link_pairs), "C5_Mode")
 
+        # C6: Terminal Flow: No flow into_id S, No flow out of E
         m.addConstr(X.sum('*', S, '*') == 0, "C6_Start")
         m.addConstr(X.sum(E, '*', '*') == 0, "C6_End")
 
+        # C7: Total Time Budget: Sum(D_ij^m * x_ij^m) + K * (T_race + T_rest_min) <= T_max
         travel_time = X.prod(coeffs['D'])
         m.addConstr(travel_time + K * (T_race + T_rest_min) <= T_max, "C7_Time")
 
+        # C8: Sea Freight Lead Time: D_ij^Sea * x_ij^Sea >= L_min * x_ij^Sea
+        # Note: This is equivalent to_id D_ij^Sea >= L_min ONLY if x_ij^Sea = 1.
+        # This constraint is inherently satisfied if the input data D_ij^Sea >= L_min.
+        # However, to_id be mathematically rigorous: (D_ij^Sea - L_min) * x_ij^Sea >= 0
         for k in links:
             if k[2] == 'Sea':
                 m.addConstr((coeffs['D'][k] - L_min) * X[k] >= 0, f"C8_Sea_{k}")
 
         n_nodes = len(V)
+        # C9: Subtour Elimination (MTZ): u_i - u_j + K * Sum_m (x_ij^m) <= K - 1
         for i in V:
             for j in V:
                 if i != j:
@@ -88,6 +102,7 @@ def create_and_solve_gurobi_milp(data_loader, objective_index, number_of_solutio
                     if (i,j) in link_pairs:
                         m.addConstr(U[i] - U[j] + n_nodes * relevant_links <= n_nodes - 1, f"C9_MTZ_{i}_{j}")
 
+        # C10: Sequence Fixed Points: u_S = 1, u_E = K
         m.addConstr(U[S] == 1, "C10_Start")
         m.addConstr(U[E] == K, "C10_End")
 
@@ -96,8 +111,10 @@ def create_and_solve_gurobi_milp(data_loader, objective_index, number_of_solutio
         Obj_map = {1: Z1_expr, 2: Z2_expr, 3: -Z3_expr}
 
         if eps_values is None:
+            # Phase 1: Solving for Ideal/Nadir points
             m.setObjective(Obj_map[objective_index], GRB.MINIMIZE)
         else:
+            # Phase 2: Solving the AUGMECON sub-problem
             epsilon2, epsilon3_prime = eps_values
             R2, R3_prime = R_ranges
             delta = 1e-6 
