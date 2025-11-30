@@ -1,8 +1,8 @@
-Circuit,Hosting fee
-Bahrain International Circuit (Sakhir),55000000
-Marina Bay Street Circuit (Singapore),35000000
-Yas Marina Circuit (Abu Dhabi-UAE),42000000
-Hungaroring (Budapest-Hungary),40000000
-Albert Park (Melbourne-Australia),37000000
-Spa-Francorchamps (Belgium),22000000
-Silverstone Circuit (UK),26000000
+circuit_id,Circuit,Hosting Fees
+C1,Bahrain International Circuit (Sakhir),55000000
+C2,Marina Bay Street Circuit (Singapore),35000000
+C3,Yas Marina Circuit (Abu Dhabi-UAE),42000000
+C4,Hungaroring (Budapest-Hungary),40000000
+C5,Albert Park (Melbourne-Australia),37000000
+C6,Spa-Francorchamps (Belgium),22000000
+C7,Silverstone Circuit (UK),26000000
