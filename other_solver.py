@@ -5,6 +5,7 @@ import pandas as pd
 from collections import deque
 from data_loader import DataLoader
 from constants import *
+from plot_utils import plot_solutions_3d, plot_with_cuboid, plot_with_cuboid_and_hyperplane
 
 # ==========================================
 # 1. CORE OPTIMIZATION (AUGMECON / MILP)
@@ -178,6 +179,34 @@ def create_and_solve_gurobi_milp(data_loader, objective_index, number_of_solutio
                     'route_list': path_str,
                     'route_text': full_route_text
                 })
+        if m.status == GRB.INFEASIBLE:
+            print("\n--- Gurobi Status 3: MODEL INFEASIBLE ---")
+            
+            # 1. Compute IIS (Irreducible Inconsistent Subsystem)
+            m.computeIIS()
+            print("The following is an Irreducible Inconsistent Subsystem (IIS):")
+            
+            infeasible_constraints = []
+            
+            # 2. Iterate through all constraints and print those in the IIS
+            for c in m.getConstrs():
+                if c.IISConstr: # If the constraint is part of the IIS
+                    infeasible_constraints.append(f"Hard Constraint: {c.ConstrName} (RHS: {c.RHS})")
+                
+            # 3. For the AUGMECON phase, check the objective constraints to_ido
+            # These are the constraints C_eps_Z2 and C_eps_Z3_prime
+            if eps_values is not None:
+                for c in m.getConstrs():
+                    if c.ConstrName.startswith("Epsilon_Constraint") and c.IISConstr:
+                        infeasible_constraints.append(f"Epsilon Constraint: {c.ConstrName} (Value: {c.RHS:.2f})")
+                        
+            # 4. Print the final list
+            if infeasible_constraints:
+                print("\n".join(infeasible_constraints))
+            else:
+                print("IIS found no constraints. (Check if variables or bounds are conflicting instead).")
+                
+            return {'status': "Infeasible - IIS generated"}
                 
         return found_solutions
 
@@ -209,6 +238,13 @@ def adaptive_epsilon_rectangular_method_gurobi(data_loader):
     print(f"\n[A] Best Cost: Cost=${best_cost['Z1']:,.0f}, Emit={best_cost['Z2']:.0f}, Rev=${best_cost['Z3']:,.0f}")
     print(f"[B] Best Emit: Cost=${best_emit['Z1']:,.0f}, Emit={best_emit['Z2']:.0f}, Rev=${best_emit['Z3']:,.0f}")
     print(f"[C] Best Rev:  Cost=${best_rev['Z1']:,.0f}, Emit={best_rev['Z2']:.0f}, Rev=${best_rev['Z3']:,.0f}")
+
+    # Initial 3D plot of solution pools
+    try:
+        plot_solutions_3d(sols1, sols2, sols3p, outfile="data/solutions_3d.png")
+        print("Saved 3D scatter to data/solutions_3d.png")
+    except Exception as e:
+        print(f"Plotting error (scatter): {e}")
 
     # --- COLLECT ALL UNIQUE SOLUTIONS ---
     # We dump ALL pool solutions into the candidate list
@@ -253,6 +289,18 @@ def adaptive_epsilon_rectangular_method_gurobi(data_loader):
     z3p_min, z3p_max = min(z3p_vals), max(z3p_vals)
     
     rectangles = deque([(z2_min, z2_max, z3p_min, z3p_max)])
+
+    # Plot with initial rectangle cuboid overlay
+    try:
+        plot_with_cuboid(sols1, sols2, sols3p, rectangles[0], outfile="data/solutions_3d_with_cuboid.png")
+        print("Saved 3D scatter with cuboid to data/solutions_3d_with_cuboid.png")
+        plot_with_cuboid_and_hyperplane(
+            sols1, sols2, sols3p, rectangles[0],
+            curr_z2=z2_max, curr_z3p=z3p_max,
+            outfile="data/solutions_3d_with_cuboid_plane.png"
+        )
+    except Exception as e:
+        print(f"Plotting error (cuboid): {e}")
     
     count = 0
     while rectangles and count < 15: 
@@ -279,7 +327,7 @@ def adaptive_epsilon_rectangular_method_gurobi(data_loader):
                 if curr_z3p < rec[3]:
                     rectangles.append((curr_z2, rec[1], rec[2], curr_z3p))
                 count += 1
-    
+    print("Number of loops in rectangular search:", count)
     return NDS
 
 # ==========================================
@@ -310,6 +358,7 @@ def perform_ranking(pareto_list):
     for j in norm.columns:
         conflict = sum([1 - corr[j][k] for k in norm.columns])
         val = std[j] * conflict
+        print(f"Objective: {j}, StdDev: {std[j]:.4f}, Conflict: {conflict:.4f}, Raw Weight: {val:.4f}")
         raw_weights[j] = val
         total += val
     
@@ -326,6 +375,9 @@ def perform_ranking(pareto_list):
         rss = np.sqrt((df[col]**2).sum())
         if rss == 0: rss = 1
         vec[col] = (df[col] / rss) * final_w[col]
+    
+    print("vector normalized values (first 5 rows):")
+    print(vec.head())
         
     pis = {
         'cost': vec['cost'].min(), 'emission': vec['emission'].min(), 'revenue': vec['revenue'].max()
@@ -333,6 +385,11 @@ def perform_ranking(pareto_list):
     nis = {
         'cost': vec['cost'].max(), 'emission': vec['emission'].max(), 'revenue': vec['revenue'].min()
     }
+    print("\n{:<15} {:<15} {:<15}".format("Objective", "PIS", "NIS"))
+    print("-" * 45)
+    for obj in ['cost', 'emission', 'revenue']:
+        obj_label = {'cost': 'Z1', 'emission': 'Z2', 'revenue': 'Z3'}[obj]
+        print("{:<15} {:<15.6f} {:<15.6f}".format(obj_label, pis[obj], nis[obj]))
     
     d_pis = np.sqrt(((vec[['cost','emission','revenue']] - pd.Series(pis))**2).sum(axis=1))
     d_nis = np.sqrt(((vec[['cost','emission','revenue']] - pd.Series(nis))**2).sum(axis=1))
@@ -341,10 +398,26 @@ def perform_ranking(pareto_list):
     df['closeness'] = d_nis / denom.replace(0, 1)
     df['rank'] = df['closeness'].rank(ascending=False)
     
-    # Final Output
+    # Final Output: sort by rank first
     df = df.sort_values('rank')
+
+    # Dynamic table print (Schedule d+, d−, Closeness, Rank) using computed values
+    # Print only rank 1, 2, 3
+    print("\n{:<10} {:>10} {:>10} {:>12} {:>6}".format("Schedule", "d+", "d-", "Closeness (Ci)", "Rank"))
+    print("-" * 54)
+    d_pis_sorted = d_pis.loc[df.index]
+    d_nis_sorted = d_nis.loc[df.index]
+    for i, (idx, row) in enumerate(df.head(3).iterrows(), start=1):
+        sched_label = row['label']
+        dp = float(d_pis_sorted.loc[idx])
+        dn = float(d_nis_sorted.loc[idx])
+        ci = float(row['closeness'])
+        rk = int(row['rank'])
+        print("{:<10} {:>10.5f} {:>10.5f} {:>12.4f} {:>6}".format(sched_label, dp, dn, ci, rk))
     
     print(f"\n--- FINAL RANKINGS (Showing top {min(len(df), 5)} of {len(df)} candidates) ---")
+
+
     
     top_n = df.head(5)
     for idx, row in top_n.iterrows():
