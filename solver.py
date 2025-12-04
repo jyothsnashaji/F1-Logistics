@@ -1,25 +1,35 @@
 import gurobipy as gp
 from gurobipy import GRB
 import numpy as np
-import random
+import pandas as pd
 from collections import deque
-import math
 from data_loader import DataLoader
 from constants import *
-# --- Core Optimization Function (Gurobi) ---
+from plot_utils import plot_solutions_3d, plot_with_cuboid, plot_with_cuboid_and_hyperplane
 
-def create_and_solve_gurobi_milp(data_loader, objective_index, eps_values=None, R_ranges=None):
+# ==========================================
+# 1. CORE OPTIMIZATION (AUGMECON / MILP)
+# ==========================================
+
+def create_and_solve_gurobi_milp(data_loader, objective_index, number_of_solutions, eps_values=None, R_ranges=None):
     """
-    Creates and solves the single-objective MILP (AUGMECON) using Gurobi.
-    Objective index: 1 (Z1: Cost), 2 (Z2: Emissions), 3 (Z3': Negative Revenue)
+    Solves the MILP and returns the Top N solutions found (Solution Pool).
     """
+    found_solutions = []
+    
     try:
-        # Load Parameters
-        m = gp.Model("F1_Logistics_MOO_Subproblem")
-        m.setParam('OutputFlag', 0) # Suppress Gurobi output
+        m = gp.Model("F1_Logistics")
+        m.setParam('OutputFlag', 0)
+        
+        # --- ENABLE SOLUTION POOL ---
+        # 2 = Search for n best solutions
+        m.setParam(GRB.Param.PoolSearchMode, 2) 
+        # Limit pool size to top 10 solutions per run
+        m.setParam(GRB.Param.PoolSolutions, number_of_solutions) 
+        # Gap tolerance (relative) to accept slightly suboptimal solutions
+        m.setParam(GRB.Param.PoolGap, 0.20) # Accept solutions within 20% of optimal
 
         V = data_loader.load_circuits()
-        M = ['Air', 'Road', 'Sea']
         S, E = data_loader.get_season_start_end()
         K = data_loader.get_total_num_required_races()
         T_max = data_loader.get_max_season_days()
@@ -27,94 +37,80 @@ def create_and_solve_gurobi_milp(data_loader, objective_index, eps_values=None, 
         T_rest_min = data_loader.get_minimum_rest_days()
         L_min = data_loader.get_lead_time_min()
         
-        # Coefficients and decision-variable domain restricted to actual transport links
         links = data_loader.keys
         R_i = data_loader.get_circuit_revenue()
+        id_map = data_loader.get_circuit_names()
 
         coeffs = {
-            'C': data_loader.get_link_costs(), # Cost
-            'E': data_loader.get_link_emissions(), # Emission
-            'D': data_loader.get_link_times() # Time (uniform per link)
+            'C': data_loader.get_link_costs(),
+            'E': data_loader.get_link_emissions(),
+            'D': data_loader.get_link_times()
         }
         
-        # 1. Decision Variables
-        X = m.addVars(links, vtype=GRB.BINARY, name="x")      # x_ij^m
-        Y = m.addVars(V, vtype=GRB.BINARY, name="y")          # y_i
-        U = m.addVars(V, vtype=GRB.INTEGER, lb=1, ub=K, name="u") # u_i (Sequence position index, C12)
+        # Variables
+        X = m.addVars(links, vtype=GRB.BINARY, name="x")
+        Y = m.addVars(V, vtype=GRB.BINARY, name="y")
+        U = m.addVars(V, vtype=GRB.INTEGER, lb=1, ub=K, name="u")
 
         for key in links:
-            cost_map = data_loader.get_link_costs() 
-            if cost_map[key] == CRAZY_BUG_NUMBER:
+            if coeffs['C'][key] >= CRAZY_BUG_NUMBER:
                 X[key].ub = 0
 
-        # 2. Objective Functions (Expressions)
-        # Z1: Total Logistical Cost (Minimize)
-        Z1 = X.prod(coeffs['C']) 
-        # Z2: Total Carbon Emissions (Minimize)
-        Z2 = X.prod(coeffs['E'])
-        # Z3: Total Commercial Revenue (Maximize)
-        Z3 = Y.prod(R_i)
-        
-        # Z3' (Negative Revenue) for minimization
-        Z3_prime = -Z3
+        # Objectives Expressions
+        Z1_expr = X.prod(coeffs['C']) 
+        Z2_expr = X.prod(coeffs['E']) 
+        Z3_expr = Y.prod(R_i)         
 
-        Obj_map = {1: Z1, 2: Z2, 3: Z3_prime}
-
-        # 3. Constraints (C1 - C10)
-        
+        # Constraints
         # C1: Race Count: Sum(y_i) = K
-        m.addConstr(Y.sum('*') == K, name="C1_Race_Count")
-        
-        # C2: Fixed Start/End: y_S = 1, y_E = 1
-        m.addConstr(Y[S] == 1, name="C2_Start_Fixed")
-        m.addConstr(Y[E] == 1, name="C2_End_Fixed")
-            
-        # C3: Single Link Out: Sum_j,m (x_ij^m) = y_i for all i
-        m.addConstrs((X.sum(i, '*', '*') == Y[i] for i in V if i != E), name="C3_Link_Out_i_ne_E")
+        m.addConstr(Y.sum('*') == K, "C1")
 
-        # C4: Single Link In: Sum_i,m (x_ij^m) = y_j for all j
-        m.addConstrs((X.sum('*', j, '*') == Y[j] for j in V if j != S), name="C4_Link_In_j_ne_S")
+        # C2: Fixed Start/End: y_S = 1, y_E = 1
+        m.addConstr(Y[S] == 1, "C2_Start")
+        m.addConstr(Y[E] == 1, "C2_End")
         
+        # C3: Single Link Out: Sum_j,m (x_ij^m) = y_i for all i
+        m.addConstrs((X.sum(i, '*', '*') == Y[i] for i in V if i != E), "C3_Out")
+        # C4: Single Link In: Sum_i,m (x_ij^m) = y_j for all j
+        m.addConstrs((X.sum('*', j, '*') == Y[j] for j in V if j != S), "C4_In")
+
         # C5: Single Mode Per Link: Sum_m (x_ij^m) <= 1 for all (i,j) present in transport data
-        links_ij = sorted(set((from_id, to_id) for from_id, to_id, _ in links))
-        m.addConstrs((X.sum(i, j, '*') <= 1 for i, j in links_ij), name="C5_Single_Mode")
+        link_pairs = list(set((k[0], k[1]) for k in links))
+        m.addConstrs((X.sum(i, j, '*') <= 1 for i, j in link_pairs), "C5_Mode")
 
         # C6: Terminal Flow: No flow into_id S, No flow out of E
-        m.addConstr(X.sum('*', S, '*') == 0, name="C6_Flow_In_S")
-        m.addConstr(X.sum(E, '*', '*') == 0, name="C6_Flow_Out_E")
+        m.addConstr(X.sum('*', S, '*') == 0, "C6_Start")
+        m.addConstr(X.sum(E, '*', '*') == 0, "C6_End")
 
-        # C7: To_idtal Time Budget: Sum(D_ij^m * x_ij^m) + K * (T_race + T_rest_min) <= T_max
+        # C7: Total Time Budget: Sum(D_ij^m * x_ij^m) + K * (T_race + T_rest_min) <= T_max
         travel_time = X.prod(coeffs['D'])
-        to_idtal_fixed_time = K * (T_race + T_rest_min)
-        m.addConstr(travel_time + to_idtal_fixed_time <= T_max, name="C7_To_idtal_Time_Budget")
+        m.addConstr(travel_time + K * (T_race + T_rest_min) <= T_max, "C7_Time")
 
         # C8: Sea Freight Lead Time: D_ij^Sea * x_ij^Sea >= L_min * x_ij^Sea
         # Note: This is equivalent to_id D_ij^Sea >= L_min ONLY if x_ij^Sea = 1.
         # This constraint is inherently satisfied if the input data D_ij^Sea >= L_min.
         # However, to_id be mathematically rigorous: (D_ij^Sea - L_min) * x_ij^Sea >= 0
-        for i, j in links_ij:
-            # Apply lead-time check only if a Sea-mode link exists in data
-            if (i, j, 'Sea') in coeffs['D']:
-                D_sea = coeffs['D'][i, j, 'Sea']
-                m.addConstr((D_sea - L_min) * X[i, j, 'Sea'] >= 0, name=f"C8_Sea_Lead_{i}_{j}")
+        for k in links:
+            if k[2] == 'Sea':
+                m.addConstr((coeffs['D'][k] - L_min) * X[k] >= 0, f"C8_Sea_{k}")
 
-        # C9: Subto_idur Elimination (MTZ): u_i - u_j + K * Sum_m (x_ij^m) <= K - 1
+        n_nodes = len(V)
+        # C9: Subtour Elimination (MTZ): u_i - u_j + K * Sum_m (x_ij^m) <= K - 1
         for i in V:
             for j in V:
                 if i != j:
-                    m.addConstr(U[i] - U[j] + K * X.sum(i, j, '*') <= K - 1, name=f"C9_MTZ_{i}_{j}")
+                    relevant_links = X.sum(i, j, '*')
+                    if (i,j) in link_pairs:
+                        m.addConstr(U[i] - U[j] + n_nodes * relevant_links <= n_nodes - 1, f"C9_MTZ_{i}_{j}")
 
         # C10: Sequence Fixed Points: u_S = 1, u_E = K
-        m.addConstr(U[S] == 1, name="C10_Seq_Start")
-        m.addConstr(U[E] == K, name="C10_Seq_End")
+        m.addConstr(U[S] == 1, "C10_Start")
+        m.addConstr(U[E] == K, "C10_End")
 
-        # C11 & C12: Variable domains (set during definition)
-        # We also need to_id enforce U[i] to_id be set only if Y[i]=1, but since 
-        # the to_idur constraints (C3, C4) ensure that only selected nodes are part of the path, 
-        # and C9 links X to_id U, the variable U will only have meaningful values 
-        # for selected nodes. Since U is constrained to_id [1, K], this is usually sufficient.
-        
-        # 4. Set Objective and Epsilon Constraints
+        # Objective Setup
+        # Note: Revenue (Z3) is maximized, so we minimize Negative Revenue (-Z3)
+        Obj_map = {1: Z1_expr, 2: Z2_expr, 3: -Z3_expr}
+
         if eps_values is None:
             # Phase 1: Solving for Ideal/Nadir points
             m.setObjective(Obj_map[objective_index], GRB.MINIMIZE)
@@ -123,60 +119,66 @@ def create_and_solve_gurobi_milp(data_loader, objective_index, eps_values=None, 
             epsilon2, epsilon3_prime = eps_values
             R2, R3_prime = R_ranges
             delta = 1e-6 
+            S2 = m.addVar(vtype=GRB.CONTINUOUS, lb=0, name="S2")
+            S3_prime = m.addVar(vtype=GRB.CONTINUOUS, lb=0, name="S3_prime")
             
-            # Slack variables for the epsilon constraints
-            S2 = m.addVar(vtype=GRB.CONTINUOUS, lb=0, name="S2") # Slack for Z2 (Emissions)
-            S3_prime = m.addVar(vtype=GRB.CONTINUOUS, lb=0, name="S3_prime") # Slack for Z3' (Neg. Revenue)
+            # Minimize Cost + Slacks
+            m.setObjective(Z1_expr - delta * (S2/R2 + S3_prime/R3_prime), GRB.MINIMIZE)
             
-            # Primary Objective: Z1 - delta * (S2/R2 + S3'/R3') -> MINIMIZE
-            m.setObjective(Z1 - delta * (S2/R2 + S3_prime/R3_prime), GRB.MINIMIZE)
-            
-            # Epsilon Constraints (Z_k + S_k = epsilon_k)
-            # Z2 (Emissions) <= epsilon2
-            m.addConstr(Z2 + S2 == epsilon2, "Epsilon_Constraint_Z2")
-            # Z3' (Neg. Revenue) <= epsilon3_prime
-            m.addConstr(Z3_prime + S3_prime == epsilon3_prime, "Epsilon_Constraint_Z3_prime")
+            # Epsilon Constraints
+            m.addConstr(Z2_expr + S2 == epsilon2, "Eps_Z2")
+            m.addConstr((-Z3_expr) + S3_prime == epsilon3_prime, "Eps_Z3p")
 
-        # 5. Optimize
         m.optimize()
 
+        # --- EXTRACT ALL SOLUTIONS FROM POOL ---
         if m.status == GRB.OPTIMAL:
-            # Collect results
-            m.update()
-            # --- Objective Values ---
-            Z1_val = Z1.getValue()
-            Z2_val = Z2.getValue()
-            Z3_val = Z3.getValue()
-            
-            # --- Decision Variables ---
-            
-            # 1. Selected Circuits (y_i)
-            selected_circuits = [i for i in V if Y[i].X > 0.5]
-            
-            # 2. Selected Links (x_ij^m)
-            selected_links = []
-            for (i, j, mode) in links:
-                if X[i, j, mode].x > 0.5:
-                    selected_links.append({
-                        'from_id': i, 
-                        'to_id': j, 
-                        'mode': mode, 
-                        'sequence_start': U[i].X if i in selected_circuits else None # Add sequence index for clarity
-                    })
-            
-            # Sort the links by the sequence index (u_i) for a readable to_idur
-            selected_links.sort(key=lambda link: link.get('sequence_start', float('inf')))
+            # Iterate over all found solutions in the pool
+            for k in range(m.SolCount):
+                m.setParam(GRB.Param.SolutionNumber, k) # Select solution k
+                
+                # Reconstruct Path for solution k
+                path_str = []
+                curr = S
+                # Simple path trace
+                # Note: recovering the sequence from variables Xn is strictly needed
+                # For visualization, we scan for active links
+                active_links = []
+                for key in links:
+                    if X[key].Xn > 0.5: # Use Xn for pool solution value
+                        active_links.append(key)
+                
+                # Since we have the active links, let's sort them by connectivity to make a route string
+                # Simple ordered reconstruction
+                curr_node = S
+                for _ in range(K-1):
+                    found = False
+                    for (u_node, v_node, mode) in active_links:
+                        if u_node == curr_node:
+                            c_name = id_map.get(u_node, u_node)
+                            j_name = id_map.get(v_node, v_node)
+                            path_str.append(f"{c_name} -> {j_name} ({mode})")
+                            curr_node = v_node
+                            found = True
+                            break
+                    if not found: break
+                
+                full_route_text = "\n".join(path_str) if path_str else "Route Reconstruction Error"
 
-            # Collect results
-            results = {
-                'status': "Optimal",
-                'Z1': Z1_val,
-                'Z2': Z2_val,
-                'Z3': Z3_val,
-                'selected_circuits': selected_circuits,
-                'selected_links': selected_links
-            }
-            return results
+                # Calculate objective values manually for this pool solution
+                # (Gurobi objective value might include slack penalties)
+                z1_val = sum(coeffs['C'][key] * X[key].Xn for key in links)
+                z2_val = sum(coeffs['E'][key] * X[key].Xn for key in links)
+                z3_val = sum(R_i.get(i,0) * Y[i].Xn for i in V)
+
+                found_solutions.append({
+                    'status': "Optimal",
+                    'Z1': z1_val,
+                    'Z2': z2_val,
+                    'Z3': z3_val,
+                    'route_list': path_str,
+                    'route_text': full_route_text
+                })
         if m.status == GRB.INFEASIBLE:
             print("\n--- Gurobi Status 3: MODEL INFEASIBLE ---")
             
@@ -196,8 +198,8 @@ def create_and_solve_gurobi_milp(data_loader, objective_index, eps_values=None, 
             if eps_values is not None:
                 for c in m.getConstrs():
                     if c.ConstrName.startswith("Epsilon_Constraint") and c.IISConstr:
-                         infeasible_constraints.append(f"Epsilon Constraint: {c.ConstrName} (Value: {c.RHS:.2f})")
-                         
+                        infeasible_constraints.append(f"Epsilon Constraint: {c.ConstrName} (Value: {c.RHS:.2f})")
+                        
             # 4. Print the final list
             if infeasible_constraints:
                 print("\n".join(infeasible_constraints))
@@ -205,136 +207,233 @@ def create_and_solve_gurobi_milp(data_loader, objective_index, eps_values=None, 
                 print("IIS found no constraints. (Check if variables or bounds are conflicting instead).")
                 
             return {'status': "Infeasible - IIS generated"}
-        return {'status': f"Gurobi Status: {m.status}"}
+                
+        return found_solutions
 
     except gp.GurobiError as e:
-        return {'status': f"Gurobi Error: {e}"}
-    except Exception as e:
-        return {'status': f"General Error: {e}"}
+        print(f"Gurobi Error: {e}")
+        return []
 
-# -------------------------------------------------------------
-# --- Main Adaptive Epsilon Algorithm (Gurobi Integration) ---
-# -------------------------------------------------------------
+# ==========================================
+# 2. ADAPTIVE RECTANGULAR ALGORITHM
+# ==========================================
 
 def adaptive_epsilon_rectangular_method_gurobi(data_loader):
-    """
-    Implements the full Adaptive Epsilon (Rectangular) Method.
-    Constrained objectives are Z2 (Emissions, Min) and Z3' (Neg. Revenue, Min).
-    """
+    print("--- 1. SINGLE OBJECTIVE OPTIMIZATIONS (EXTREMES) ---")
     
-    print("--- Phase 1: Initialization (Ideal & Nadir Points) ---")
-    
-    # 1. Compute Payoff Table
-    
-    # Objective indices: 1 (Z1: Cost, MIN), 2 (Z2: Emissions, MIN), 3 (Z3': Neg. Revenue, MIN)
-    sol1 = create_and_solve_gurobi_milp(data_loader, objective_index=1)
-    sol2 = create_and_solve_gurobi_milp(data_loader, objective_index=2)
-    # Z3 is MAX Revenue, so we optimize Z3' (Neg. Revenue) for MIN
-    sol3_prime = create_and_solve_gurobi_milp(data_loader, objective_index=3)
+    # We allow the solver to return lists of solutions now
+    sols1 = create_and_solve_gurobi_milp(data_loader, 1, 20) # Min Cost
+    sols2 = create_and_solve_gurobi_milp(data_loader, 2, 20) # Min Emission
+    sols3p = create_and_solve_gurobi_milp(data_loader, 3, 20) # Max Revenue
 
-    if not all(sol['status'] == 'Optimal' for sol in [sol1, sol2, sol3_prime]):
-        return "Error: Initial single-objective problems could not be solved to_id optimality."
+    if not sols1 or not sols2 or not sols3p:
+        print("Error: Could not solve single objectives.")
+        return []
 
-    # Z_matrix rows: [Z1, Z2, Z3] (Z3 is Max Revenue)
-    Z_matrix = np.array([
-        [sol1['Z1'], sol2['Z1'], sol3_prime['Z1']], 
-        [sol1['Z2'], sol2['Z2'], sol3_prime['Z2']], 
-        [sol1['Z3'], sol2['Z3'], sol3_prime['Z3']], 
-    ])
-    
-    # Ideal Point: (min Z1, min Z2, max Z3)
-    Z_ideal = (np.min(Z_matrix[0, :]), np.min(Z_matrix[1, :]), np.max(Z_matrix[2, :]))
-    
-    # Nadir Point: (max Z1, max Z2, min Z3)
-    Z_nadir = (np.max(Z_matrix[0, :]), np.max(Z_matrix[1, :]), np.min(Z_matrix[2, :]))
-    
-    print(f"Ideal Point (Z1 min, Z2 min, Z3 max): ({Z_ideal[0]:.2f}, {Z_ideal[1]:.2f}, {Z_ideal[2]:.2f})")
-    print(f"Nadir Point (Z1 max, Z2 max, Z3 min): ({Z_nadir[0]:.2f}, {Z_nadir[1]:.2f}, {Z_nadir[2]:.2f})")
+    # Best extremes (Index 0 is the optimal one)
+    best_cost = sols1[0]
+    best_emit = sols2[0]
+    best_rev = sols3p[0]
 
-    # Calculate Ranges for constrained objectives (Z2 and Z3')
-    R_Z2 = Z_nadir[1] - Z_ideal[1] # Range for Emissions (Z2)
-    R_Z3 = Z_ideal[2] - Z_nadir[2] # Range for Revenue (Z3)
-    
-    # Convert Z3 values (Max Revenue) to_id Z3' (Min Neg. Revenue)
-    Z3_prime_min = -Z_ideal[2] 
-    Z3_prime_max = -Z_nadir[2] 
-    R_Z3_prime = Z3_prime_max - Z3_prime_min # Range is the same as R_Z3
+    print(f"\n[A] Best Cost: Cost=${best_cost['Z1']:,.0f}, Emit={best_cost['Z2']:.0f}, Rev=${best_cost['Z3']:,.0f}")
+    print(f"[B] Best Emit: Cost=${best_emit['Z1']:,.0f}, Emit={best_emit['Z2']:.0f}, Rev=${best_emit['Z3']:,.0f}")
+    print(f"[C] Best Rev:  Cost=${best_rev['Z1']:,.0f}, Emit={best_rev['Z2']:.0f}, Rev=${best_rev['Z3']:,.0f}")
 
-    R_ranges = (R_Z2, R_Z3_prime)
-    
-    # Initial Non-Dominated Set (NDS) - Include Z1-optimal solution
-    NDS = {(sol1['Z1'], sol1['Z2'], sol1['Z3'])}
-    
-    # Initial Rectangle (in Z2 and Z3' space): [Z2_min, Z2_max] x [Z3'_min, Z3'_max]
-    initial_rectangle = (Z_ideal[1], Z_nadir[1], Z3_prime_min, Z3_prime_max)
-    Rectangles = deque([initial_rectangle])
+    # Initial 3D plot of solution pools
+    try:
+        plot_solutions_3d(sols1, sols2, sols3p, outfile="data/solutions_3d.png")
+        print("Saved 3D scatter to data/solutions_3d.png")
+    except Exception as e:
+        print(f"Plotting error (scatter): {e}")
 
-    print("\n--- Phase 2: Adaptive Epsilon (Rectangular Search) ---")
+    # --- COLLECT ALL UNIQUE SOLUTIONS ---
+    # We dump ALL pool solutions into the candidate list
+    # This ensures "near optimal" solutions are included in the final ranking
+    NDS = []
     
-    # 2. Rectangular Search Loop
-    while Rectangles:
-        eps2_low, eps2_high, eps3p_low, eps3p_high = Rectangles.popleft()
-        
-        # Set the Epsilon-Constraints (Use the 'high' values for min-min problems)
-        epsilon2 = eps2_high         # Emissions constraint
-        epsilon3_prime = eps3p_high  # Negative Revenue constraint
-        
-        # Solve the AUGMECON Sub-Problem
-        new_sol = create_and_solve_gurobi_milp(
-            data_loader, 
-            objective_index=1, 
-            eps_values=(epsilon2, epsilon3_prime), 
-            R_ranges=R_ranges
+    def add_candidates(sol_list, label_prefix):
+        for idx, s in enumerate(sol_list):
+            entry = {
+                'label': f"{label_prefix}_{idx+1}",
+                'cost': s['Z1'], 
+                'emission': s['Z2'], 
+                'revenue': s['Z3'], 
+                'route_text': s['route_text']
+            }
+            # Check for duplicates based on objective values
+            is_dupe = any(
+                np.isclose(x['cost'], entry['cost']) and 
+                np.isclose(x['emission'], entry['emission']) and
+                np.isclose(x['revenue'], entry['revenue'])
+                for x in NDS
+            )
+            if not is_dupe:
+                NDS.append(entry)
+
+    add_candidates(sols1, "MinCost")
+    add_candidates(sols2, "MinEmit")
+    add_candidates(sols3p, "MaxRev")
+
+    # --- PARETO GENERATION ---
+    print("\n--- 2. ADAPTIVE RECTANGULAR SEARCH (PARETO GENERATION) ---")
+    
+    # Ranges for epsilon method
+    z2_vals = [s['Z2'] for s in [best_cost, best_emit, best_rev]]
+    z3p_vals = [-s['Z3'] for s in [best_cost, best_emit, best_rev]]
+    
+    R2 = max(z2_vals) - min(z2_vals) + 1
+    R3p = max(z3p_vals) - min(z3p_vals) + 1
+    R_ranges = (R2, R3p)
+    
+    z2_min, z2_max = min(z2_vals), max(z2_vals)
+    z3p_min, z3p_max = min(z3p_vals), max(z3p_vals)
+    
+    rectangles = deque([(z2_min, z2_max, z3p_min, z3p_max)])
+
+    # Plot with initial rectangle cuboid overlay
+    try:
+        plot_with_cuboid(sols1, sols2, sols3p, rectangles[0], outfile="data/solutions_3d_with_cuboid.png")
+        print("Saved 3D scatter with cuboid to data/solutions_3d_with_cuboid.png")
+        plot_with_cuboid_and_hyperplane(
+            sols1, sols2, sols3p, rectangles[0],
+            curr_z2=z2_max, curr_z3p=z3p_max,
+            outfile="data/solutions_3d_with_cuboid_plane.png"
         )
-        
-        if new_sol['status'] != 'Optimal':
-            continue
-            
-        Z_new = (new_sol['Z1'], new_sol['Z2'], new_sol['Z3'])
-        
-        # Non-Dominance Check and Update NDS (Ensures solution is unique)
-        if Z_new not in NDS:
-            NDS.add(Z_new)
-            
-            # Convert Z_new values for splitting the rectangles
-            Z_new2 = Z_new[1]         # Emissions
-            Z_new3_prime = -Z_new[2]  # Negative Revenue
-
-            # Decomposition (Rectangular Splitting)
-            
-            # New Rectangle 1: Tighter Constraint on Z2 (Emissions)
-            # [Z2_low, Z2_new] x [Z3'_low, Z3'_high]
-            if Z_new2 > eps2_low and Z_new2 < eps2_high:
-                 new_rect1 = (eps2_low, Z_new2, eps3p_low, eps3p_high)
-                 Rectangles.append(new_rect1)
-                 
-            # New Rectangle 2: Tighter Constraint on Z3' (Negative Revenue)
-            # [Z2_new, Z2_high] x [Z3'_low, Z3'_new]
-            if Z_new3_prime > eps3p_low and Z_new3_prime < eps3p_high:
-                new_rect2 = (Z_new2, eps2_high, eps3p_low, Z_new3_prime)
-                Rectangles.append(new_rect2)
-                
-    # 3. Final Results
-    NDS_list = sorted(list(NDS))
-    return NDS_list
-
-# --- Execute the Code ---
-
-try:
-    loader = DataLoader() 
-    pareto_id_front = adaptive_epsilon_rectangular_method_gurobi(loader)
+    except Exception as e:
+        print(f"Plotting error (cuboid): {e}")
     
-    print("\n--- Phase 3: Final Non-Dominated Solutions (Pareto_id Front) ---")
-    print(f"Found {len(pareto_id_front)} Non-Dominated Solution(s).")
-    print("Format: (Cost, Revenue, Emission)")
-    # 
+    count = 0
+    while rectangles and count < 15: 
+        rec = rectangles.popleft()
+        eps2, eps3p = rec[1], rec[3]
+        
+        # Get list of solutions from subproblem
+        sub_sols = create_and_solve_gurobi_milp(data_loader, 1, 10, (eps2, eps3p), R_ranges)
+        
+        if sub_sols:
+            # We only use the BEST solution for the geometric splitting logic
+            best_res = sub_sols[0]
+            
+            # But we add ALL solutions found to our result pool
+            add_candidates(sub_sols, f"TradeOff_{count}")
+            
+            curr_z2 = best_res['Z2']
+            curr_z3p = -best_res['Z3']
+            
+            # Simple check to avoid infinite loops if solver returns same point
+            if curr_z2 > rec[0] and curr_z3p > rec[2]:
+                if curr_z2 < rec[1]: # Only split if inside bounds
+                    rectangles.append((rec[0], curr_z2, rec[2], rec[3]))
+                if curr_z3p < rec[3]:
+                    rectangles.append((curr_z2, rec[1], rec[2], curr_z3p))
+                count += 1
+    print("Number of loops in rectangular search:", count)
+    return NDS
+
+# ==========================================
+# 3. MCDM (RANKING)
+# ==========================================
+
+def perform_ranking(pareto_list):
+    print("\n--- 3. MCDM RANKING (D-CRITIC + TOPSIS) ---")
+    df = pd.DataFrame(pareto_list)
     
-    # Output table of non-dominated solutions
-    table = []
-    for i, (z1, z2, z3) in enumerate(pareto_id_front):
-         table.append(f"Solution {i+1}: Cost={z1:.2f}, Revenue={z2:.2f}, Emission={z3:.2f}")
+    # Normalize
+    norm = pd.DataFrame()
+    for col in ['cost', 'emission']: 
+        denom = df[col].max() - df[col].min()
+        if denom == 0: denom = 1
+        norm[col] = (df[col].max() - df[col]) / denom # Min
+        
+    denom = df['revenue'].max() - df['revenue'].min()
+    if denom == 0: denom = 1
+    norm['revenue'] = (df['revenue'] - df['revenue'].min()) / denom # Max
+    
+    # Weights
+    std = norm.std().fillna(0)
+    corr = norm.corr().fillna(0)
+    
+    raw_weights = {}
+    total = 0
+    for j in norm.columns:
+        conflict = sum([1 - corr[j][k] for k in norm.columns])
+        val = std[j] * conflict
+        print(f"Objective: {j}, StdDev: {std[j]:.4f}, Conflict: {conflict:.4f}, Raw Weight: {val:.4f}")
+        raw_weights[j] = val
+        total += val
+    
+    if total == 0:
+        final_w = {k: 0.33 for k in raw_weights}
+    else:
+        final_w = {k: v/total for k,v in raw_weights.items()}
+        
+    print(f"Objective Weights: {final_w}")
+    
+    # TOPSIS
+    vec = pd.DataFrame()
+    for col in ['cost','emission','revenue']:
+        rss = np.sqrt((df[col]**2).sum())
+        if rss == 0: rss = 1
+        vec[col] = (df[col] / rss) * final_w[col]
+    
+    print("vector normalized values (first 5 rows):")
+    print(vec.head())
+        
+    pis = {
+        'cost': vec['cost'].min(), 'emission': vec['emission'].min(), 'revenue': vec['revenue'].max()
+    }
+    nis = {
+        'cost': vec['cost'].max(), 'emission': vec['emission'].max(), 'revenue': vec['revenue'].min()
+    }
+    print("\n{:<15} {:<15} {:<15}".format("Objective", "PIS", "NIS"))
+    print("-" * 45)
+    for obj in ['cost', 'emission', 'revenue']:
+        obj_label = {'cost': 'Z1', 'emission': 'Z2', 'revenue': 'Z3'}[obj]
+        print("{:<15} {:<15.6f} {:<15.6f}".format(obj_label, pis[obj], nis[obj]))
+    
+    d_pis = np.sqrt(((vec[['cost','emission','revenue']] - pd.Series(pis))**2).sum(axis=1))
+    d_nis = np.sqrt(((vec[['cost','emission','revenue']] - pd.Series(nis))**2).sum(axis=1))
+    
+    denom = d_pis + d_nis
+    df['closeness'] = d_nis / denom.replace(0, 1)
+    df['rank'] = df['closeness'].rank(ascending=False)
+    
+    # Final Output: sort by rank first
+    df = df.sort_values('rank')
 
-    print("\n".join(table))
+    # Dynamic table print (Schedule d+, d−, Closeness, Rank) using computed values
+    # Print only rank 1, 2, 3
+    print("\n{:<10} {:>10} {:>10} {:>12} {:>6}".format("Schedule", "d+", "d-", "Closeness (Ci)", "Rank"))
+    print("-" * 54)
+    d_pis_sorted = d_pis.loc[df.index]
+    d_nis_sorted = d_nis.loc[df.index]
+    for i, (idx, row) in enumerate(df.head(3).iterrows(), start=1):
+        sched_label = row['label']
+        dp = float(d_pis_sorted.loc[idx])
+        dn = float(d_nis_sorted.loc[idx])
+        ci = float(row['closeness'])
+        rk = int(row['rank'])
+        print("{:<10} {:>10.5f} {:>10.5f} {:>12.4f} {:>6}".format(sched_label, dp, dn, ci, rk))
+    
+    print(f"\n--- FINAL RANKINGS (Showing top {min(len(df), 5)} of {len(df)} candidates) ---")
 
-except Exception as e:
-    print(f"An error occurred during execution: {e}")
+
+    
+    top_n = df.head(5)
+    for idx, row in top_n.iterrows():
+        print(f"\nRANK {int(row['rank'])}: {row['label']}")
+        print(f"  Score: {row['closeness']:.4f}")
+        print(f"  Stats: Cost=${row['cost']:,.0f}, Emit={row['emission']:.0f}, Rev=${row['revenue']:,.0f}")
+        print(f"  Route:")
+        print("    " + row['route_text'].replace("\n", "\n    "))
+
+if __name__ == "__main__":
+    loader = DataLoader()
+    if loader.circuits:
+        results = adaptive_epsilon_rectangular_method_gurobi(loader)
+        if len(results) > 0:
+            perform_ranking(results)
+        else:
+            print("No solutions found.")
+    else:
+        print("System Error: No circuits loaded.")
